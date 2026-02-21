@@ -33,6 +33,7 @@ from services.clinical import extract_clinical_data
 from services.summary import generate_summary
 from services.red_flags import detect_red_flags
 from services.icd_mapper import map_icd10
+from services.treatment import suggest_treatment_and_medications
 
 app = FastAPI(title="Medical Conversation Analyzer", version="1.0.0")
 
@@ -136,7 +137,19 @@ def analyze(data: STTInput):
                     icd_mappings = []
                     print(f"Warning: ICD mapping failed: {str(e)}")
 
-        # Step 7: Summary generation
+        # Step 7: Treatment and medication suggestions
+        treatment_suggestions = {}
+        if clinical_json and not ("error" in clinical_json):
+            try:
+                treatment_suggestions = suggest_treatment_and_medications(clinical_json, cleaned_text)
+                if "error" in treatment_suggestions:
+                    treatment_suggestions = {}
+            except Exception as e:
+                # Don't fail the entire request if treatment suggestion fails
+                treatment_suggestions = {}
+                print(f"Warning: Treatment suggestion failed: {str(e)}")
+
+        # Step 8: Summary generation
         summary_json = generate_summary(doctor_speech, cleaned_text)
 
         if "error" in summary_json:
@@ -150,7 +163,8 @@ def analyze(data: STTInput):
             "structured_clinical_data": clinical_json,
             "conversation_summary": summary_json,
             "red_flags": red_flags_result,
-            "icd10_mappings": icd_mappings
+            "icd10_mappings": icd_mappings,
+            "treatment_suggestions": treatment_suggestions
         }
 
         return response

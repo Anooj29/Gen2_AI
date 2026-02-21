@@ -36,6 +36,17 @@ from services.icd_mapper import map_icd10
 
 app = FastAPI(title="Medical Conversation Analyzer", version="1.0.0")
 
+# Pre-load ICD data on startup for faster first request
+@app.on_event("startup")
+async def startup_event():
+    """Pre-load ICD data on application startup."""
+    try:
+        from services.icd_mapper import _load_icd_data
+        _load_icd_data()
+        print("ICD-10 data pre-loaded successfully")
+    except Exception as e:
+        print(f"Warning: Could not pre-load ICD data: {str(e)}")
+
 @app.get("/")
 def root():
     return {"message": "Medical Conversation Analyzer API", "status": "running"}
@@ -80,8 +91,8 @@ def analyze(data: STTInput):
         # Step 2: Clean transcript
         cleaned_text = clean_transcript(transcript)
 
-        # Step 3: Separate speakers
-        speaker_data = separate_speakers(cleaned_text)
+        # Step 3: Separate speakers (use fast heuristic mode by default)
+        speaker_data = separate_speakers(cleaned_text, use_llm=False)
         
         if not isinstance(speaker_data, dict):
             return {
@@ -99,7 +110,8 @@ def analyze(data: STTInput):
             }
 
         # Step 4: Red flag detection (early detection for emergencies)
-        red_flags_result = detect_red_flags(cleaned_text)
+        # Use fast keyword-based mode by default to keep latency low.
+        red_flags_result = detect_red_flags(cleaned_text, use_llm=False)
         
         # Step 5: Clinical extraction (only if patient speech exists)
         clinical_json = {}
@@ -117,7 +129,8 @@ def analyze(data: STTInput):
             diagnoses = clinical_json.get("possible_diagnosis", [])
             if isinstance(diagnoses, list) and len(diagnoses) > 0:
                 try:
-                    icd_mappings = map_icd10(diagnoses, top_k=3)
+                    # Disable LLM enhancement here for speed; mapping uses CSV similarity.
+                    icd_mappings = map_icd10(diagnoses, top_k=3, use_llm_enhancement=False)
                 except Exception as e:
                     # Don't fail the entire request if ICD mapping fails
                     icd_mappings = []

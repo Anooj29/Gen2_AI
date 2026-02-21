@@ -8,10 +8,11 @@ from services.llm import call_llama
 # Global variable to store loaded ICD data
 icd_data = None
 icd_data_loaded = False
+original_desc_col = None  # Store the description column name
 
 def _load_icd_data():
     """Load ICD-10 dataset. Handles path resolution and errors gracefully."""
-    global icd_data, icd_data_loaded
+    global icd_data, icd_data_loaded, original_desc_col
     
     if icd_data_loaded:
         return icd_data
@@ -74,7 +75,7 @@ def _load_icd_data():
             
             icd_data["long_desc_lower"] = icd_data[desc_col].astype(str).str.lower()
             icd_data["code"] = icd_data[code_col].astype(str)
-            icd_data["original_desc_col"] = desc_col  # Store for later use
+            original_desc_col = desc_col  # Store globally for later use
             
             icd_data_loaded = True
             return icd_data
@@ -158,42 +159,112 @@ def map_icd10(diagnosis_list: List[str], top_k: int = 3, use_llm_enhancement: bo
             if enhanced_diagnosis:
                 diagnosis_lower = enhanced_diagnosis.lower()
         
+        # Normalize diagnosis: remove common words that don't help matching
+        stop_words = {"acute", "chronic", "unspecified", "other", "and", "the", "a", "an"}
+        diagnosis_words = [w for w in diagnosis_lower.split() if w not in stop_words and len(w) > 2]
+        diagnosis_words_set = set(diagnosis_words)
+        diagnosis_key_terms = " ".join(diagnosis_words)
+        
+        # Key medical terms for fast pre-filtering
+        key_medical_terms = {"infection", "fever", "pain", "cough", "injury", "fracture", 
+                            "disease", "syndrome", "disorder", "inflammation"}
+        diagnosis_has_medical_term = any(term in diagnosis_lower for term in key_medical_terms)
+        
+        # FAST PRE-FILTER: Use vectorized string operations to filter candidates
+        # Only check rows that have at least one matching word (much faster)
+        if len(diagnosis_words) > 0:
+            # Create a mask for rows that might match
+            word_mask = icd_data["long_desc_lower"].str.contains("|".join(diagnosis_words[:3]), case=False, na=False, regex=True)
+            # Also check short desc
+            word_mask = word_mask | icd_data["short_desc_lower"].str.contains("|".join(diagnosis_words[:3]), case=False, na=False, regex=True)
+            # If medical term present, also check for that
+            if diagnosis_has_medical_term:
+                medical_mask = icd_data["long_desc_lower"].str.contains("|".join(key_medical_terms), case=False, na=False, regex=True)
+                word_mask = word_mask | medical_mask
+            
+            # Filter to only potential matches (reduces search space dramatically)
+            candidate_rows = icd_data[word_mask].copy()
+        else:
+            # If no meaningful words, check a limited sample
+            candidate_rows = icd_data.head(500).copy()
+        
+        # Limit candidates to reasonable number for performance (prioritize quality)
+        if len(candidate_rows) > 500:
+            # Take first 500 candidates (they're already filtered by relevance)
+            candidate_rows = candidate_rows.head(500)
+        
         scored_matches = []
         
-        # Search through ICD data
-        for _, row in icd_data.iterrows():
-            short_desc = str(row.get("short_desc_lower", "")).lower()
-            long_desc = str(row.get("long_desc_lower", "")).lower()
-            code = str(row.get("code", ""))
+        # Now only iterate through pre-filtered candidates
+        for idx, row in candidate_rows.iterrows():
+            short_desc = str(row["short_desc_lower"]).lower()
+            long_desc = str(row["long_desc_lower"]).lower()
+            code = str(row["code"])
             
-            # Calculate similarity scores
+            if not code or code == "nan":
+                continue
+            
+            # Fast word overlap check first (cheapest)
+            desc_words = set((short_desc + " " + long_desc).split())
+            desc_words_clean = {w for w in desc_words if w not in stop_words and len(w) > 2}
+            
+            if len(diagnosis_words_set) > 0:
+                word_overlap = len(diagnosis_words_set & desc_words_clean) / len(diagnosis_words_set)
+            else:
+                word_overlap = 0
+            
+            # Skip if no word overlap at all (fast exit)
+            if word_overlap < 0.1:
+                continue
+            
+            # Only calculate expensive similarity scores if word overlap is promising
             score_short = similarity_score(diagnosis_lower, short_desc)
             score_long = similarity_score(diagnosis_lower, long_desc)
             
-            # Also check if key terms match
-            diagnosis_words = set(diagnosis_lower.split())
-            desc_words = set((short_desc + " " + long_desc).split())
-            word_overlap = len(diagnosis_words & desc_words) / max(len(diagnosis_words), 1)
+            # Quick key terms check
+            short_desc_clean = " ".join([w for w in short_desc.split() if w not in stop_words and len(w) > 2])
+            long_desc_clean = " ".join([w for w in long_desc.split() if w not in stop_words and len(w) > 2])
+            score_key_terms = max(
+                similarity_score(diagnosis_key_terms, short_desc_clean),
+                similarity_score(diagnosis_key_terms, long_desc_clean)
+            )
             
-            # Combined score
-            score = max(score_short, score_long) * 0.7 + word_overlap * 0.3
+            # Check if any key medical terms match (boost score)
+            medical_term_match = diagnosis_has_medical_term and any(term in (short_desc + " " + long_desc) for term in key_medical_terms)
             
-            if score > 0.30:  # Lowered threshold for better recall
-                # Get description from stored column or try to find it
-                desc_col = icd_data.get("original_desc_col", None)
+            # Combined score with multiple factors
+            base_score = max(score_short, score_long, score_key_terms)
+            combined_score = base_score * 0.5 + word_overlap * 0.4 + score_key_terms * 0.1
+            
+            # Boost if medical terms match
+            if medical_term_match:
+                combined_score = min(1.0, combined_score + 0.1)
+            
+            # Lower threshold and require at least some word overlap for better recall
+            if combined_score > 0.25 or (word_overlap > 0.3 and combined_score > 0.15):
+                # Get description from stored column
+                global original_desc_col
+                desc_col = original_desc_col
                 if desc_col is None:
                     desc_cols = [col for col in icd_data.columns if "description" in col.lower() or "desc" in col.lower()]
                     desc_col = desc_cols[0] if desc_cols else None
                 
-                description = str(row.get(desc_col, "")) if desc_col else str(row.get("long_desc_lower", ""))
+                if desc_col and desc_col in row:
+                    description = str(row[desc_col])
+                else:
+                    description = str(long_desc) if long_desc else ""
                 
                 scored_matches.append({
                     "diagnosis": diagnosis_original,
                     "enhanced_diagnosis": enhanced_diagnosis if enhanced_diagnosis else None,
                     "icd_code": code,
                     "description": description,
-                    "confidence_score": round(score, 3)
+                    "confidence_score": round(combined_score, 3)
                 })
+                
+                # Early exit if we have enough high-confidence matches
+                if len(scored_matches) >= top_k * 2 and combined_score > 0.7:
+                    break
         
         # Sort best matches
         scored_matches = sorted(scored_matches, key=lambda x: x["confidence_score"], reverse=True)
@@ -202,10 +273,13 @@ def map_icd10(diagnosis_list: List[str], top_k: int = 3, use_llm_enhancement: bo
         seen_codes = {}
         for match in scored_matches:
             code = match["icd_code"]
-            if code not in seen_codes or match["confidence_score"] > seen_codes[code]["confidence_score"]:
-                seen_codes[code] = match
+            if code and code != "nan":
+                if code not in seen_codes or match["confidence_score"] > seen_codes[code]["confidence_score"]:
+                    seen_codes[code] = match
         
-        results.extend(list(seen_codes.values())[:top_k])
+        # Return top matches
+        top_matches = list(seen_codes.values())[:top_k]
+        results.extend(top_matches)
     
     return results
 

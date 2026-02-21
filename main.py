@@ -31,6 +31,8 @@ from services.text_cleaner import clean_transcript
 from services.speaker import separate_speakers
 from services.clinical import extract_clinical_data
 from services.summary import generate_summary
+from services.red_flags import detect_red_flags
+from services.icd_mapper import map_icd10
 
 app = FastAPI(title="Medical Conversation Analyzer", version="1.0.0")
 
@@ -96,7 +98,10 @@ def analyze(data: STTInput):
                 "details": "Could not extract patient or doctor speech from transcript"
             }
 
-        # Step 4: Clinical extraction (only if patient speech exists)
+        # Step 4: Red flag detection (early detection for emergencies)
+        red_flags_result = detect_red_flags(cleaned_text)
+        
+        # Step 5: Clinical extraction (only if patient speech exists)
         clinical_json = {}
         if cleaned_text:
             clinical_json = extract_clinical_data(cleaned_text)
@@ -106,7 +111,19 @@ def analyze(data: STTInput):
                     "details": clinical_json
                 }
 
-        # Step 5: Summary generation
+        # Step 6: ICD-10 code mapping (if diagnoses are available)
+        icd_mappings = []
+        if clinical_json and "possible_diagnosis" in clinical_json:
+            diagnoses = clinical_json.get("possible_diagnosis", [])
+            if isinstance(diagnoses, list) and len(diagnoses) > 0:
+                try:
+                    icd_mappings = map_icd10(diagnoses, top_k=3)
+                except Exception as e:
+                    # Don't fail the entire request if ICD mapping fails
+                    icd_mappings = []
+                    print(f"Warning: ICD mapping failed: {str(e)}")
+
+        # Step 7: Summary generation
         summary_json = generate_summary(doctor_speech, cleaned_text)
 
         if "error" in summary_json:
@@ -115,10 +132,15 @@ def analyze(data: STTInput):
                 "details": summary_json
             }
 
-        return {
+        # Build comprehensive response
+        response = {
             "structured_clinical_data": clinical_json,
-            "conversation_summary": summary_json
+            "conversation_summary": summary_json,
+            "red_flags": red_flags_result,
+            "icd10_mappings": icd_mappings
         }
+
+        return response
     
     except HTTPException:
         raise
